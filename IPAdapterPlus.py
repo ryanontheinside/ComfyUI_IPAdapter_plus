@@ -326,7 +326,12 @@ def ipadapter_execute(model,
                         print(f"\033[33mINFO: InsightFace detection resolution lowered to {size}.\033[0m")
                     break
             else:
-                raise Exception('InsightFace: No face detected.')
+                print(f"\033[33mINFO: No face detected in image {i}. Skipping this image.\033[0m")
+
+        if len(face_cond_embeds) == 0:
+            print("\033[33mINFO: No faces detected in any of the input images. Returning unmodified model.\033[0m")
+            return (model, None)
+
         face_cond_embeds = torch.stack(face_cond_embeds).to(device, dtype=dtype)
         image = torch.stack(image)
         del image_iface, face
@@ -1175,6 +1180,168 @@ class IPAdapterClipVisionEnhancer(IPAdapterAdvanced):
 
     CATEGORY = "ipadapter/dev"
 
+import torch
+import torch.nn.functional as F
+from contextlib import contextmanager
+
+@contextmanager
+def torch_gc():
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+class IPAdapterClipVisionEnhancerBatch(IPAdapterAdvanced):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", ),
+                "ipadapter": ("IPADAPTER", ),
+                "image": ("IMAGE",),
+                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 5, "step": 0.05 }),
+                "weight_type": (WEIGHT_TYPES, ),
+                "combine_embeds": (["concat", "add", "subtract", "average", "norm average"],),
+                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "embeds_scaling": (['V only', 'K+V', 'K+V w/ C penalty', 'K+mean(V) w/ C penalty'], ),
+                "enhance_tiles": ("INT", { "default": 2, "min": 1, "max": 16 }),
+                "enhance_ratio": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05 }),
+            },
+            "optional": {
+                "image_negative": ("IMAGE",),
+                "attn_mask": ("MASK",),
+                "clip_vision": ("CLIP_VISION",),
+            }
+        }
+
+    CATEGORY = "ipadapter/dev"
+
+    def apply_ipadapter(self, model, ipadapter, image, weight, weight_type, start_at, end_at, combine_embeds, embeds_scaling, enhance_tiles, enhance_ratio, image_negative=None, attn_mask=None, clip_vision=None):
+        if 'ipadapter' in ipadapter:
+            ipadapter_model = ipadapter['ipadapter']['model']
+            clip_vision = clip_vision if clip_vision is not None else ipadapter['clipvision']['model']
+        else:
+            ipadapter_model = ipadapter
+
+        if clip_vision is None:
+            raise Exception("Missing CLIPVision model.")
+
+        batch_size = image.shape[0]
+
+        print(f"Input image shape: {image.shape}")
+
+        with torch_gc():
+            # Resize images to 224x224
+            image = self.resize_image_batch(image, (224, 224))
+            
+            if image_negative is not None:
+                image_negative = self.resize_image_batch(image_negative, (224, 224))
+
+            # print(f"Resized image shape: {image.shape}")
+
+            # Enhance the image before passing it to encode_image_masked
+            enhanced_image = self.enhance_image_batch(image, enhance_tiles, enhance_ratio)
+
+            # print(f"Enhanced image shpe: {enhanced_image.shape}")
+
+            ipa_args = {
+                "image": enhanced_image,
+                "image_negative": image_negative,
+                "weight": weight,
+                "weight_type": weight_type,
+                "combine_embeds": combine_embeds,
+                "start_at": start_at,
+                "end_at": end_at,
+                "attn_mask": attn_mask,
+                "unfold_batch": False,
+                "embeds_scaling": embeds_scaling,
+                "encode_batch_size": batch_size,
+            }
+
+            work_model, _ = ipadapter_execute(model.clone(), ipadapter_model, clip_vision, **ipa_args)
+
+        del enhanced_image, image, image_negative
+        return (work_model,)
+
+    @staticmethod
+    def resize_image_batch(image_batch, target_size):
+        with torch_gc():
+            # image_batch is in NHWC format
+            if image_batch.shape[1:3] == target_size:
+                return image_batch
+
+            # Calculate the scaling factor
+            h, w = image_batch.shape[1:3]
+            scale = min(target_size[0] / h, target_size[1] / w)
+
+            # Calculate new size
+            new_h, new_w = int(h * scale), int(w * scale)
+
+            # Resize
+            image_batch = image_batch.permute(0, 3, 1, 2)  # NHWC to NCHW
+            resized_batch = F.interpolate(image_batch, size=(new_h, new_w), mode='bicubic', align_corners=False)
+
+            # Pad if necessary
+            pad_h = target_size[0] - new_h
+            pad_w = target_size[1] - new_w
+            if pad_h > 0 or pad_w > 0:
+                resized_batch = F.pad(resized_batch, (0, pad_w, 0, pad_h), mode='constant', value=0)
+
+            resized_batch = resized_batch.permute(0, 2, 3, 1)  # NCHW to NHWC
+            del image_batch
+            return resized_batch
+
+    @staticmethod
+    def enhance_image_batch(image_batch, tiles, ratio):
+        enhanced_images = []
+        for idx, img in enumerate(image_batch):
+            # print(f"Processing image {idx} in batch. Shape: {img.shape}")
+            with torch_gc():
+                enhanced_img = IPAdapterClipVisionEnhancerBatch.enhance_image(img, tiles, ratio)
+            # print(f"Enhanced image {idx} shape: {enhanced_img.shape}")
+            enhanced_images.append(enhanced_img)
+        
+        enhanced_batch = torch.stack(enhanced_images, dim=0)
+        del enhanced_images
+        return enhanced_batch
+
+    @staticmethod
+    def enhance_image(image, tiles, ratio):
+        with torch_gc():
+            h, w, c = image.shape
+            tile_size_h = h // tiles
+            tile_size_w = w // tiles
+
+            enhanced_image = torch.zeros((h, w, c), device=image.device, dtype=image.dtype)
+
+            for i in range(tiles):
+                for j in range(tiles):
+                    tile = image[i*tile_size_h:(i+1)*tile_size_h, j*tile_size_w:(j+1)*tile_size_w, :]
+                    
+                    enhanced_tile = F.interpolate(tile.unsqueeze(0).permute(0, 3, 1, 2), 
+                                                  scale_factor=ratio, 
+                                                  mode='bicubic', 
+                                                  align_corners=False)
+                    enhanced_tile = enhanced_tile.permute(0, 2, 3, 1).squeeze(0)
+                    
+                    # Resize enhanced tile back to original tile size if necessary
+                    if enhanced_tile.shape[:2] != (tile_size_h, tile_size_w):
+                        enhanced_tile = F.interpolate(enhanced_tile.unsqueeze(0).permute(0, 3, 1, 2),
+                                                      size=(tile_size_h, tile_size_w),
+                                                      mode='bicubic',
+                                                      align_corners=False)
+                        enhanced_tile = enhanced_tile.permute(0, 2, 3, 1).squeeze(0)
+                    
+                    enhanced_image[i*tile_size_h:(i+1)*tile_size_h, j*tile_size_w:(j+1)*tile_size_w, :] = enhanced_tile
+                    del enhanced_tile
+
+            del image
+            return enhanced_image
+        
+
 class IPAdapterFromParams(IPAdapterAdvanced):
     @classmethod
     def INPUT_TYPES(s):
@@ -1430,6 +1597,9 @@ class PrepImageForClipVision:
     CATEGORY = "ipadapter/utils"
 
     def prep_image(self, image, interpolation="LANCZOS", crop_position="center", sharpening=0.0):
+        #if empty stack or malformed image return
+        if 0 in image.shape:
+            return (image,)
         size = (224, 224)
         _, oh, ow, _ = image.shape
         output = image.permute([0,3,1,2])
@@ -1834,6 +2004,8 @@ class IPAdapterCombineParams:
  Register
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
+
+
 NODE_CLASS_MAPPINGS = {
     # Main Apply Nodes
     "IPAdapter": IPAdapterSimple,
@@ -1854,6 +2026,7 @@ NODE_CLASS_MAPPINGS = {
     "IPAdapterPreciseStyleTransferBatch": IPAdapterPreciseStyleTransferBatch,
     "IPAdapterPreciseComposition": IPAdapterPreciseComposition,
     "IPAdapterPreciseCompositionBatch": IPAdapterPreciseCompositionBatch,
+    "IPAdapterClipVisionEnhancerBatch": IPAdapterClipVisionEnhancerBatch,
 
     # Loaders
     "IPAdapterUnifiedLoader": IPAdapterUnifiedLoader,
@@ -1897,7 +2070,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IPAdapterPreciseStyleTransferBatch": "IPAdapter Precise Style Transfer Batch",
     "IPAdapterPreciseComposition": "IPAdapter Precise Composition",
     "IPAdapterPreciseCompositionBatch": "IPAdapter Precise Composition Batch",
-
+    "IPAdapterClipVisionEnhancerBatch":"IPAdapter ClipVision Enhancer Batch",
     # Loaders
     "IPAdapterUnifiedLoader": "IPAdapter Unified Loader",
     "IPAdapterUnifiedLoaderFaceID": "IPAdapter Unified Loader FaceID",
